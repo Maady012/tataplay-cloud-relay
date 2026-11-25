@@ -15,6 +15,7 @@ let lastFetchTime = 0;
 
 const DATA_URL = "https://raw.githubusercontent.com/Babel-In/Tata-Play-IPTV/main/data.json";
 const CK_URL = "https://raw.githubusercontent.com/Rajveer-Mahida/tataplay_live/main/src/staticData/config.json";
+const TG_URL = "https://raw.githubusercontent.com/piyushsingh8373/Tataplay-Tivimate-link/main/TataPlay-TG@M3UIndia-23Dec.m3u";
 
 function sanitizeBrand(str) {
   if (!str) return "";
@@ -29,10 +30,11 @@ async function refreshCacheIfNeeded() {
   const now = Date.now();
   if (channelsData.length === 0 || now - lastFetchTime > 6 * 60 * 60 * 1000) {
     try {
-      console.log("[Relay] Syncing upstream catalog and ClearKeys...");
-      const [resData, resCk] = await Promise.all([
+      console.log("[Relay] Syncing upstream catalogs and ClearKeys...");
+      const [resData, resCk, resTg] = await Promise.all([
         axios.get(DATA_URL, { timeout: 15000 }),
-        axios.get(CK_URL, { timeout: 15000 })
+        axios.get(CK_URL, { timeout: 15000 }),
+        axios.get(TG_URL, { timeout: 15000 })
       ]);
 
       channelsData = resData.data || [];
@@ -47,8 +49,35 @@ async function refreshCacheIfNeeded() {
           };
         }
       }
+
+      // Merge keys from Telegram community M3U (includes Zee TV HD, Colors HD, etc.)
+      const tgLines = (resTg.data || "").split("\n");
+      for (let i = 0; i < tgLines.length; i++) {
+        const line = tgLines[i];
+        if (line.includes("#KODIPROP:inputstream.adaptive.license_key=")) {
+          const keyJsonStr = line.split("#KODIPROP:inputstream.adaptive.license_key=")[1].trim();
+          let nextExt = tgLines[i + 1] || "";
+          let nextUrl = tgLines[i + 2] || "";
+          if (!nextExt.startsWith("#EXTINF") && tgLines[i + 2]?.startsWith("#EXTINF")) {
+            nextExt = tgLines[i + 2];
+            nextUrl = tgLines[i + 3] || "";
+          }
+          const m = nextExt.match(/tvg-id="ts(\d+)"/);
+          if (m && m[1]) {
+            const cid = m[1];
+            try {
+              const parsedKey = JSON.parse(keyJsonStr);
+              clearKeyMap[cid] = {
+                channel_key: parsedKey,
+                linear_url: nextUrl.trim().startsWith("http") ? nextUrl.trim() : null
+              };
+            } catch (e) {}
+          }
+        }
+      }
+
       lastFetchTime = now;
-      console.log(`[Relay] Synced ${channelsData.length} channels.`);
+      console.log(`[Relay] Synced ${channelsData.length} channels and ${Object.keys(clearKeyMap).length} ClearKeys.`);
     } catch (err) {
       console.error("[Relay] Error syncing cache:", err.message);
     }
@@ -60,7 +89,7 @@ app.get("/", (req, res) => {
   res.json({
     status: "online",
     system: "MaddyFusion Live Core",
-    version: "2.1.0",
+    version: "2.2.0",
     catalog: channelsData.length
   });
 });
@@ -69,7 +98,8 @@ app.get("/", (req, res) => {
 app.get("/:endpoint", async (req, res) => {
   await refreshCacheIfNeeded();
   let ep = req.params.endpoint.toLowerCase().replace(".m3u", "");
-  const host = `${req.protocol}://${req.get("host")}`;
+  // Force HTTPS for Android players
+  const host = `https://${req.get("host")}`;
 
   let header = `#EXTM3U x-tvg-url="https://raw.githubusercontent.com/Maady012/maddytv-iptv/main/epg.xml.gz,https://avkb.short.gy/tsepg.xml.gz"\n\n`;
   let entries = [];
@@ -97,7 +127,6 @@ app.get("/:endpoint", async (req, res) => {
     } else if (ep === "hindi") {
       if (lang.toLowerCase() !== "hindi") continue;
     }
-    // "all", "playlist", "maddytv", "live" returns the whole 700+ channels catalog
 
     const streamData = ch.streamData || {};
     const origUrl = streamData.dashWidewinePlayUrl || streamData.initialUrl;
@@ -142,7 +171,8 @@ app.get("/live/:id/manifest.mpd", async (req, res) => {
   }
 
   const streamData = ch.streamData || {};
-  let targetUrl = streamData.dashWidewinePlayUrl || streamData.initialUrl;
+  const ckInfo = clearKeyMap[id] || {};
+  let targetUrl = ckInfo.linear_url || streamData.dashWidewinePlayUrl || streamData.initialUrl;
 
   if (!targetUrl) {
     return res.status(404).send("Stream offline");
