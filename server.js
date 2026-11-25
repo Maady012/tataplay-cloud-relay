@@ -16,12 +16,20 @@ let lastFetchTime = 0;
 const DATA_URL = "https://raw.githubusercontent.com/Babel-In/Tata-Play-IPTV/main/data.json";
 const CK_URL = "https://raw.githubusercontent.com/Rajveer-Mahida/tataplay_live/main/src/staticData/config.json";
 
+function sanitizeBrand(str) {
+  if (!str) return "";
+  return str
+    .replace(/tata\s*play/gi, "Maddy")
+    .replace(/tatasky/gi, "Maddy")
+    .replace(/tata/gi, "Maddy")
+    .trim();
+}
+
 async function refreshCacheIfNeeded() {
   const now = Date.now();
-  // Refresh cache every 6 hours
   if (channelsData.length === 0 || now - lastFetchTime > 6 * 60 * 60 * 1000) {
     try {
-      console.log("[Relay] Refreshing channels data and ClearKeys...");
+      console.log("[Relay] Syncing upstream catalog and ClearKeys...");
       const [resData, resCk] = await Promise.all([
         axios.get(DATA_URL, { timeout: 15000 }),
         axios.get(CK_URL, { timeout: 15000 })
@@ -40,31 +48,27 @@ async function refreshCacheIfNeeded() {
         }
       }
       lastFetchTime = now;
-      console.log(`[Relay] Loaded ${channelsData.length} channels and ${Object.keys(clearKeyMap).length} ClearKeys.`);
+      console.log(`[Relay] Synced ${channelsData.length} channels.`);
     } catch (err) {
-      console.error("[Relay] Error refreshing cache:", err.message);
+      console.error("[Relay] Error syncing cache:", err.message);
     }
   }
 }
 
-// Health check
+// Stealth root health endpoint
 app.get("/", (req, res) => {
   res.json({
     status: "online",
-    name: "Tata Play Always-On Cloud Relay",
-    channels: channelsData.length,
-    endpoints: {
-      playlist: "/playlist.m3u",
-      sports: "/sports.m3u",
-      tamil: "/tamil.m3u"
-    }
+    system: "MaddyFusion Live Core",
+    version: "2.1.0",
+    catalog: channelsData.length
   });
 });
 
-// Dynamic M3U Playlist generator
-app.get("/:type.m3u", async (req, res) => {
+// Master All-In-One & Category Playlists
+app.get("/:endpoint", async (req, res) => {
   await refreshCacheIfNeeded();
-  const type = req.params.type.toLowerCase();
+  let ep = req.params.endpoint.toLowerCase().replace(".m3u", "");
   const host = `${req.protocol}://${req.get("host")}`;
 
   let header = `#EXTM3U x-tvg-url="https://raw.githubusercontent.com/Maady012/maddytv-iptv/main/epg.xml.gz,https://avkb.short.gy/tsepg.xml.gz"\n\n`;
@@ -72,22 +76,28 @@ app.get("/:type.m3u", async (req, res) => {
 
   for (const ch of channelsData) {
     const id = String(ch.id || "");
-    const name = ch.channel_name || "Unknown";
+    const rawName = ch.channel_name || "Unknown";
+    const name = sanitizeBrand(rawName);
     const logo = ch.channel_logo || "";
     const genres = Array.isArray(ch.channel_genre) ? ch.channel_genre : [ch.channel_genre || "General"];
-    const genre = genres[0] || "General";
+    const genre = sanitizeBrand(genres[0] || "General");
     const langs = Array.isArray(ch.subchannel_names) ? ch.subchannel_names : [ch.subchannel_names || "All"];
     const lang = langs[0] || "All";
 
-    // Filtering based on requested playlist type
-    if (type === "sports") {
+    // Filtering logic
+    if (ep === "sports") {
       const isSport = genres.some(g => String(g).toLowerCase().includes("sport")) ||
-                      name.toLowerCase().includes("sport") ||
-                      name.toLowerCase().includes("cricket");
+                      rawName.toLowerCase().includes("sport") ||
+                      rawName.toLowerCase().includes("cricket");
       if (!isSport) continue;
-    } else if (type === "tamil") {
+    } else if (ep === "tamil") {
       if (lang.toLowerCase() !== "tamil") continue;
+    } else if (ep === "telugu") {
+      if (lang.toLowerCase() !== "telugu") continue;
+    } else if (ep === "hindi") {
+      if (lang.toLowerCase() !== "hindi") continue;
     }
+    // "all", "playlist", "maddytv", "live" returns the whole 700+ channels catalog
 
     const streamData = ch.streamData || {};
     const origUrl = streamData.dashWidewinePlayUrl || streamData.initialUrl;
@@ -108,37 +118,36 @@ app.get("/:type.m3u", async (req, res) => {
       kodiProp += `#KODIPROP:inputstream.adaptive.license_key=${ckInfo.key}\n`;
     }
 
-    const proxyStreamUrl = `${host}/stream/${id}/manifest.mpd`;
+    const proxyStreamUrl = `${host}/live/${id}/manifest.mpd`;
     entries.push(
-      `#EXTINF:-1 tvg-id="${id}" tvg-name="${name}" tvg-logo="${logo}" group-title="${lang} | ${genre}", ${name}\n` +
+      `#EXTINF:-1 tvg-id="maddy_${id}" tvg-name="${name}" tvg-logo="${logo}" group-title="${lang} | ${genre}", ${name}\n` +
       kodiProp +
       `${proxyStreamUrl}\n`
     );
   }
 
   res.setHeader("Content-Type", "audio/x-mpegurl");
-  res.setHeader("Content-Disposition", `inline; filename="${type}.m3u"`);
+  res.setHeader("Content-Disposition", `inline; filename="${ep}.m3u"`);
   res.send(header + entries.join("\n"));
 });
 
-// Stream manifest proxy with header injection & rewrite
-app.get("/stream/:id/manifest.mpd", async (req, res) => {
+// Stream manifest proxy with stealth headers & edge resolution
+app.get("/live/:id/manifest.mpd", async (req, res) => {
   await refreshCacheIfNeeded();
   const id = req.params.id;
   const ch = channelsData.find(c => String(c.id) === id);
 
   if (!ch) {
-    return res.status(404).send("Channel not found");
+    return res.status(404).send("Stream unavailable");
   }
 
   const streamData = ch.streamData || {};
   let targetUrl = streamData.dashWidewinePlayUrl || streamData.initialUrl;
 
   if (!targetUrl) {
-    return res.status(404).send("Manifest URL not found");
+    return res.status(404).send("Stream offline");
   }
 
-  // Handle Akamai host routing
   if (targetUrl.includes("linear.akamaized.net") || targetUrl.includes("catchup.akamaized.net")) {
     targetUrl = targetUrl.replace("bpprod", "bpaita");
   }
@@ -158,13 +167,11 @@ app.get("/stream/:id/manifest.mpd", async (req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.send(upstream.data);
   } catch (err) {
-    // If Akamai throws 400/403, redirect directly so player can try alternative route
-    console.error(`[Stream Error ${id}]:`, err.message);
     res.redirect(targetUrl);
   }
 });
 
 app.listen(PORT, async () => {
-  console.log(`[TataPlay Cloud Relay] Running on port ${PORT}`);
+  console.log(`[MaddyFusion Live Core] Listening on port ${PORT}`);
   await refreshCacheIfNeeded();
 });
